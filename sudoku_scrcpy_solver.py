@@ -14,6 +14,7 @@ from typing import Callable, Dict, List, Optional, Tuple
 import cv2
 import numpy as np
 import win32gui
+import win32con
 import win32ui
 
 
@@ -259,11 +260,55 @@ class ScrcpyManager:
         return cv2.cvtColor(image, cv2.COLOR_BGRA2BGR)
 
     def tap(self, x: int, y: int) -> None:
+        self.ensure_ready()
+        if self.hwnd and not win32gui.IsIconic(self.hwnd):
+            try:
+                client_x, client_y = self._device_to_client_point(int(x), int(y))
+                lparam = ((client_y & 0xFFFF) << 16) | (client_x & 0xFFFF)
+                logger.info(
+                    "window_tap hwnd=%s device_x=%s device_y=%s client_x=%s client_y=%s",
+                    self.hwnd,
+                    int(x),
+                    int(y),
+                    client_x,
+                    client_y,
+                )
+                win32gui.PostMessage(self.hwnd, win32con.WM_MOUSEMOVE, 0, lparam)
+                win32gui.PostMessage(self.hwnd, win32con.WM_LBUTTONDOWN, win32con.MK_LBUTTON, lparam)
+                win32gui.PostMessage(self.hwnd, win32con.WM_LBUTTONUP, 0, lparam)
+                return
+            except Exception:
+                logger.exception("window_tap_failed hwnd=%s device_x=%s device_y=%s", self.hwnd, x, y)
         if not self.adb_serial:
             raise RuntimeError("未拿到 adb 设备序列号")
-        logger.info("adb_tap serial=%s x=%s y=%s", self.adb_serial, x, y)
+        logger.info("adb_tap_fallback serial=%s x=%s y=%s", self.adb_serial, x, y)
         cmd = ["adb", "-s", self.adb_serial, "shell", "input", "tap", str(int(x)), str(int(y))]
-        subprocess.run(cmd, check=True, capture_output=True)
+        subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    def _device_to_client_point(self, x: int, y: int) -> Tuple[int, int]:
+        if not self.hwnd or not self.device_size:
+            raise RuntimeError("scrcpy 尚未准备好")
+        client_rect = win32gui.GetClientRect(self.hwnd)
+        client_w = max(1, client_rect[2] - client_rect[0])
+        client_h = max(1, client_rect[3] - client_rect[1])
+        device_w, device_h = self.device_size
+        target_ratio = device_w / device_h
+        current_ratio = client_w / client_h
+        if current_ratio > target_ratio:
+            content_h = client_h
+            content_w = int(round(content_h * target_ratio))
+            offset_x = max(0, (client_w - content_w) // 2)
+            offset_y = 0
+        else:
+            content_w = client_w
+            content_h = int(round(content_w / target_ratio))
+            offset_x = 0
+            offset_y = max(0, (client_h - content_h) // 2)
+        client_x = offset_x + int(round(x * content_w / device_w))
+        client_y = offset_y + int(round(y * content_h / device_h))
+        client_x = min(max(0, client_x), client_w - 1)
+        client_y = min(max(0, client_y), client_h - 1)
+        return client_x, client_y
 
 
 class SudokuVision:
@@ -1373,9 +1418,9 @@ class SudokuApp:
             board_center = self._cell_center_in_device(self.last_read.geometry, move.row, move.col, content_shape)
             keypad_center = self._keypad_center_in_device(self.last_read.keypad_rect, move.value, content_shape)
             self.scrcpy.tap(*board_center)
-            time.sleep(0.18)
+            time.sleep(0.05)
             self.scrcpy.tap(*keypad_center)
-            time.sleep(0.35)
+            time.sleep(0.14)
             value = 0
             score = 0.0
             confirm_image = None
@@ -1404,7 +1449,7 @@ class SudokuApp:
                 )
                 if value == move.value:
                     break
-                time.sleep(0.12)
+                time.sleep(0.08)
             if value != move.value:
                 self.read_screen()
                 raise RuntimeError("回填后未确认到目标数字，为避免误输，已停止本次操作")
