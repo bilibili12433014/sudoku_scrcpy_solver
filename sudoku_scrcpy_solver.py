@@ -6,7 +6,7 @@ import subprocess
 import threading
 import time
 import tkinter as tk
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from itertools import combinations
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
@@ -69,6 +69,8 @@ class ReadResult:
     geometry: GridGeometry
     keypad_rect: Rect
     content_image: np.ndarray
+    missing_templates: Tuple[int, ...] = ()
+    unknown_digit_cells: set = field(default_factory=set)
 
 
 @dataclass
@@ -268,11 +270,30 @@ class SudokuVision:
     GIVEN_RGB = np.array([156, 97, 47], dtype=np.float32)
     FILLED_RGB = np.array([203, 113, 24], dtype=np.float32)
 
+    def __init__(self) -> None:
+        self.template_cache: Dict[int, np.ndarray] = {}
+        self.board_cache: Optional[List[List[int]]] = None
+
     def read(self, image_bgr: np.ndarray) -> ReadResult:
+        previous_board = [row[:] for row in self.board_cache] if self.board_cache is not None else None
         geometry = self._locate_grid(image_bgr)
         keypad_rect = self._locate_keypad(image_bgr)
-        templates = self._build_templates(image_bgr, keypad_rect)
-        board, filled_cells = self._read_board(image_bgr, geometry, templates)
+        templates, missing_templates = self._build_templates(image_bgr, keypad_rect)
+        board, filled_cells, unknown_digit_cells = self._read_board(
+            image_bgr,
+            geometry,
+            templates,
+            previous_board=previous_board,
+            allow_unknown=bool(missing_templates),
+        )
+        self.template_cache.update(templates)
+        self.board_cache = [row[:] for row in board]
+        if missing_templates:
+            logger.info(
+                "template_slots_missing values=%s unknown_cells=%s",
+                list(missing_templates),
+                sorted((row + 1, col + 1) for row, col in unknown_digit_cells),
+            )
         return ReadResult(
             board=board,
             filled_cells=filled_cells,
@@ -280,6 +301,8 @@ class SudokuVision:
             geometry=geometry,
             keypad_rect=keypad_rect,
             content_image=image_bgr,
+            missing_templates=missing_templates,
+            unknown_digit_cells=unknown_digit_cells,
         )
 
     def read_single_cell(
@@ -393,8 +416,9 @@ class SudokuVision:
             )
         return Rect(int(w * 0.05), int(h * 0.79), int(w * 0.90), int(h * 0.14))
 
-    def _build_templates(self, image_bgr: np.ndarray, keypad_rect: Rect) -> Dict[int, np.ndarray]:
+    def _build_templates(self, image_bgr: np.ndarray, keypad_rect: Rect) -> Tuple[Dict[int, np.ndarray], Tuple[int, ...]]:
         templates: Dict[int, np.ndarray] = {}
+        missing_templates: List[int] = []
         slot_w = keypad_rect.w / 9
         for value in range(1, 10):
             x1 = int(round(keypad_rect.x + (value - 1) * slot_w))
@@ -402,16 +426,29 @@ class SudokuVision:
             crop = image_bgr[keypad_rect.y : keypad_rect.y2, x1:x2]
             candidates = self._extract_digit_candidates(crop)
             if not candidates:
-                raise RuntimeError(f"未能提取底部数字模板 {value}")
+                cached = self.template_cache.get(value)
+                if cached is not None:
+                    templates[value] = cached
+                    continue
+                missing_templates.append(value)
+                continue
             mask = max(candidates, key=lambda item: int((item > 0).sum()))
             templates[value] = self._normalize_mask(mask)
-        return templates
+        if not templates:
+            raise RuntimeError("未能提取任何底部数字模板")
+        return templates, tuple(missing_templates)
 
     def _read_board(
-        self, image_bgr: np.ndarray, geometry: GridGeometry, templates: Dict[int, np.ndarray]
-    ) -> Tuple[List[List[int]], set]:
+        self,
+        image_bgr: np.ndarray,
+        geometry: GridGeometry,
+        templates: Dict[int, np.ndarray],
+        previous_board: Optional[List[List[int]]] = None,
+        allow_unknown: bool = False,
+    ) -> Tuple[List[List[int]], set, set]:
         board = [[0 for _ in range(9)] for _ in range(9)]
         filled_cells = set()
+        unknown_digit_cells = set()
         for row in range(9):
             for col in range(9):
                 x1, y1, x2, y2 = self._cell_rect(geometry, row, col)
@@ -420,13 +457,21 @@ class SudokuVision:
                 if mask is None:
                     continue
                 if digit == 0:
+                    if previous_board is not None and previous_board[row][col] != 0:
+                        board[row][col] = previous_board[row][col]
+                        if self._is_filled_digit(crop, mask):
+                            filled_cells.add((row, col))
+                        continue
+                    if allow_unknown:
+                        unknown_digit_cells.add((row, col))
+                        continue
                     raise RuntimeError(
                         f"第 {row + 1} 行第 {col + 1} 列识别不稳定，最佳分数 {score:.3f}，次优差值 {gap:.3f}"
                     )
                 board[row][col] = digit
                 if self._is_filled_digit(crop, mask):
                     filled_cells.add((row, col))
-        return board, filled_cells
+        return board, filled_cells, unknown_digit_cells
 
     def _is_filled_digit(self, crop_bgr: np.ndarray, mask: np.ndarray) -> bool:
         pixels = crop_bgr[mask > 0]
@@ -634,6 +679,7 @@ class SudokuSolver:
             self._reduce_pointing_locked_candidates,
             self._reduce_claiming_locked_candidates,
             self._reduce_x_wing,
+            self._reduce_xy_wing,
         )
         for _ in range(64):
             progress = False
@@ -882,6 +928,58 @@ class SudokuSolver:
                     if changed:
                         return f"X-Wing(数字 {value}，第 {col_a + 1}/{col_b + 1} 列锁定第 {rows[0] + 1}/{rows[1] + 1} 行)"
         return None
+
+    def _reduce_xy_wing(self, candidates: Dict[Tuple[int, int], set]) -> Optional[str]:
+        bivalue_cells = [(cell, values) for cell, values in candidates.items() if len(values) == 2]
+        for pivot, pivot_values in bivalue_cells:
+            for wing_a, wing_a_values in bivalue_cells:
+                if wing_a == pivot or not self._cells_share_unit(pivot, wing_a):
+                    continue
+                shared_a = pivot_values & wing_a_values
+                if len(shared_a) != 1:
+                    continue
+                shared_a_value = next(iter(shared_a))
+                pivot_other = pivot_values - {shared_a_value}
+                wing_a_other = wing_a_values - {shared_a_value}
+                if len(pivot_other) != 1 or len(wing_a_other) != 1:
+                    continue
+                pivot_other_value = next(iter(pivot_other))
+                target_value = next(iter(wing_a_other))
+                if pivot_other_value == target_value:
+                    continue
+                for wing_b, wing_b_values in bivalue_cells:
+                    if wing_b in (pivot, wing_a) or not self._cells_share_unit(pivot, wing_b):
+                        continue
+                    if (pivot_values & wing_b_values) != {pivot_other_value}:
+                        continue
+                    if (wing_b_values - {pivot_other_value}) != {target_value}:
+                        continue
+                    changed = False
+                    for cell, cell_values in candidates.items():
+                        if cell in (pivot, wing_a, wing_b):
+                            continue
+                        if (
+                            self._cells_share_unit(cell, wing_a)
+                            and self._cells_share_unit(cell, wing_b)
+                            and target_value in cell_values
+                        ):
+                            cell_values.discard(target_value)
+                            changed = True
+                    if changed:
+                        return (
+                            "XY-Wing("
+                            f"枢纽 r{pivot[0] + 1}c{pivot[1] + 1}，"
+                            f"翼 r{wing_a[0] + 1}c{wing_a[1] + 1} / r{wing_b[0] + 1}c{wing_b[1] + 1}，"
+                            f"删除 {target_value})"
+                        )
+        return None
+
+    def _cells_share_unit(self, first: Tuple[int, int], second: Tuple[int, int]) -> bool:
+        return (
+            first[0] == second[0]
+            or first[1] == second[1]
+            or (first[0] // 3, first[1] // 3) == (second[0] // 3, second[1] // 3)
+        )
 
     def _unit_groups(
         self,
@@ -1141,18 +1239,35 @@ class SudokuApp:
             )
             self.current_step = previous_step if keep_step else None
             self._draw_board()
-            self._update_display_info()
+            info_message: Optional[str] = None
+            if result.unknown_digit_cells:
+                missing_text = "、".join(str(value) for value in result.missing_templates) or "部分"
+                info_message = (
+                    f"底部数字 {missing_text} 已消失，本次先完成同步；仍有 "
+                    f"{len(result.unknown_digit_cells)} 个已填格未能可靠识别，暂不继续求解。"
+                )
+            elif result.missing_templates:
+                missing_text = "、".join(str(value) for value in result.missing_templates)
+                info_message = f"底部数字 {missing_text} 已消失，已复用历史模板继续识别。"
+            self._update_display_info(info_message)
             self._log_event(
                 "read_screen_completed",
                 auto=auto,
                 board_changed=board_changed,
                 result_board=self._board_to_log_text(result.board),
+                missing_templates=list(result.missing_templates),
+                unknown_digit_cells=sorted((row + 1, col + 1) for row, col in result.unknown_digit_cells),
             )
             if auto:
-                if board_changed:
+                if result.unknown_digit_cells:
+                    self.push_status("已同步画面；有消失数字且仍缺少可靠模板，暂不继续求解")
+                elif board_changed:
                     self.push_status("已自动同步最新画面")
             else:
-                self.push_status("读取完成")
+                if result.unknown_digit_cells:
+                    self.push_status("读取完成，但当前有消失数字未完全识别，程序不会报错也不会贸然求解")
+                else:
+                    self.push_status("读取完成")
         except Exception as exc:
             logger.exception("read_screen_failed auto=%s board=%s", auto, self._board_to_log_text())
             if not auto:
@@ -1166,6 +1281,21 @@ class SudokuApp:
         if not self.last_read:
             self.read_screen()
         if not self.last_read:
+            return False
+        if self.last_read.unknown_digit_cells:
+            self.current_step = None
+            self._draw_board()
+            self._update_display_info(
+                f"当前仍有 {len(self.last_read.unknown_digit_cells)} 个已填格因底部数字消失而未完全确认，先不同步下一步。"
+            )
+            self._log_event(
+                "compute_next_step_blocked_missing_templates",
+                missing_templates=list(self.last_read.missing_templates),
+                unknown_digit_cells=sorted((row + 1, col + 1) for row, col in self.last_read.unknown_digit_cells),
+                push_status=push_status,
+            )
+            if push_status:
+                self.push_status("当前有消失数字尚未可靠识别，暂不计算下一步")
             return False
         try:
             self.solver.validate(self.board)
@@ -1288,6 +1418,8 @@ class SudokuApp:
                 keypad_rect=self.last_read.keypad_rect,
                 content_image=confirm_image,
             )
+            self.vision.template_cache.update(self.last_read.templates)
+            self.vision.board_cache = [row[:] for row in self.board]
             self.current_step = None
             self._draw_board()
             self._update_display_info(
